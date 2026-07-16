@@ -1,10 +1,9 @@
 import os
 import re
 import tempfile
-import asyncio
 from time import time
 from collections import defaultdict
-from typing import List, Optional
+from typing import List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,7 +11,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from telegram.constants import ParseMode
-import edge_tts
+from gtts import gTTS
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -26,32 +25,11 @@ COOLDOWN_SECONDS = 3
 BOT_NAME = "🎙️ DRIFT VOICE"
 OWNER_NAME = "Pravin Kewat"
 OWNER_CONTACT = "@OWNERxMod1"
+BOT_VERSION = "2.0"
 
-# ----------------------------------------------------------------------
-# VOICE CONFIGURATION (Edge TTS)
-# ----------------------------------------------------------------------
-VOICES = {
-    "Hindi Female": "hi-IN-SwaraNeural",
-    "Hindi Male": "hi-IN-MadhurNeural",
-    "Hinglish Female": "en-IN-NeerjaNeural",
-    "Hinglish Male": "en-IN-PrabhatNeural",
-    "English US Female": "en-US-JennyNeural",
-    "English US Male": "en-US-GuyNeural",
-    "English UK Female": "en-GB-SoniaNeural",
-    "English UK Male": "en-GB-RyanNeural",
-    "Japanese Female": "ja-JP-NanamiNeural",
-    "Spanish Female": "es-ES-ElviraNeural",
-    "French Female": "fr-FR-DeniseNeural",
-    "German Female": "de-DE-KatjaNeural",
-}
-
-DEFAULT_VOICE = "hi-IN-SwaraNeural"
-
-# User data storage
+# Rate limiting
 user_cooldowns = defaultdict(float)
-user_voices = defaultdict(str)
-user_speeds = defaultdict(str)  # user_id -> speed
-user_themes = defaultdict(str)
+user_speeds = defaultdict(str)  # user_id -> speed_setting
 
 # ----------------------------------------------------------------------
 # LANGUAGE DETECTION
@@ -62,7 +40,8 @@ def detect_language(text: str) -> str:
         return 'hi'
     
     hinglish_keywords = ['aap', 'main', 'tum', 'hum', 'hai', 'hain', 'kya', 
-                         'kaise', 'bahut', 'thoda', 'acha', 'accha', 'sahi']
+                         'kaise', 'bahut', 'thoda', 'acha', 'accha', 'sahi',
+                         'nahi', 'haan', 'ji', 'na', 'ho', 'hoga', 'raha']
     words = text.lower().split()
     if not words:
         return 'en'
@@ -75,7 +54,7 @@ def detect_language(text: str) -> str:
 # TEXT CLEANING
 # ----------------------------------------------------------------------
 def clean_text(text: str) -> str:
-    """Clean text - remove extra spaces and fix punctuation"""
+    """Clean text"""
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[।]', '.', text)
     return text.strip()
@@ -87,28 +66,34 @@ def add_emotion_pauses(text: str) -> str:
     """Add emotion-based punctuation"""
     happy_keywords = [
         'खुश', 'मस्त', 'बढ़िया', 'शानदार', 'अच्छा', 'लव', 'प्यार',
+        'हैप्पी', 'ग्रेट', 'वंडरफुल', 'मज़ा', 'कमाल', 'सुपर',
         'happy', 'great', 'awesome', 'love', 'wonderful', 'amazing',
-        'excited', 'fantastic', 'cool', 'yay'
+        'excited', 'fantastic', 'cool', 'yay', 'woohoo'
     ]
     sad_keywords = [
-        'दुखी', 'उदास', 'बुरा', 'अकेला', 'रोना', 'दर्द',
+        'दुखी', 'उदास', 'बुरा', 'अकेला', 'रोना', 'दर्द', 'गम',
+        'सैड', 'सॉरी', 'तकलीफ', 'परेशान', 'निराश',
         'sad', 'unhappy', 'sorry', 'depressed', 'hurt', 'cry',
-        'alone', 'pain', 'suffering'
+        'alone', 'pain', 'suffering', 'worried'
     ]
     
     lower_text = text.lower()
     has_punctuation = text.rstrip().endswith(('!', '?', '.', '...'))
     
-    if any(kw in lower_text for kw in happy_keywords):
+    # Check for happy keywords
+    happy_score = sum(1 for kw in happy_keywords if kw in lower_text)
+    sad_score = sum(1 for kw in sad_keywords if kw in lower_text)
+    
+    if happy_score > sad_score:
         if not has_punctuation:
-            text += "! 😊"
-        elif not text.rstrip().endswith('😊'):
-            text += " 😊"
-    elif any(kw in lower_text for kw in sad_keywords):
+            text += "!"
+        elif not text.rstrip().endswith(('!', '?')):
+            text += "!"
+    elif sad_score > happy_score:
         if not has_punctuation:
-            text += "... 😔"
-        elif not text.rstrip().endswith('😔'):
-            text += " 😔"
+            text += "..."
+        elif not text.rstrip().endswith('...'):
+            text += "..."
     
     return clean_text(text)
 
@@ -116,7 +101,7 @@ def add_emotion_pauses(text: str) -> str:
 # TEXT SPLITTING
 # ----------------------------------------------------------------------
 def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
-    """Split long text into smaller chunks preserving sentences"""
+    """Split long text into chunks"""
     sentences = re.split(r'(?<=[.!?।])\s+', text)
     chunks = []
     current_chunk = ""
@@ -156,26 +141,16 @@ def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
     return chunks
 
 # ----------------------------------------------------------------------
-# EDGE TTS VOICE GENERATOR
+# VOICE GENERATOR (gTTS)
 # ----------------------------------------------------------------------
-async def generate_voice(text: str, voice_name: str = DEFAULT_VOICE, rate: str = "+0%") -> Optional[str]:
-    """Generate voice using Edge TTS"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp_path = tmp.name
-        
-        communicate = edge_tts.Communicate(text, voice_name, rate=rate)
-        await communicate.save(tmp_path)
-        
-        # Check file size (Telegram 50MB limit)
-        if os.path.getsize(tmp_path) > 50 * 1024 * 1024:
-            os.unlink(tmp_path)
-            return None
-        
-        return tmp_path
-    except Exception as e:
-        print(f"❌ TTS Error: {e}")
-        return None
+def generate_voice(text: str, lang: str = 'hi') -> str:
+    """Generate voice using gTTS"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        tmp_path = tmp.name
+    
+    tts = gTTS(text=text, lang=lang, slow=False)
+    tts.save(tmp_path)
+    return tmp_path
 
 # ----------------------------------------------------------------------
 # MAIN MENU BUTTONS
@@ -184,11 +159,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
     """Main menu buttons"""
     keyboard = [
         [
-            InlineKeyboardButton("🎤 Change Voice", callback_data="change_voice"),
             InlineKeyboardButton("⚡ Speed Control", callback_data="change_speed"),
-        ],
-        [
-            InlineKeyboardButton("🎨 Theme", callback_data="change_theme"),
             InlineKeyboardButton("📊 My Settings", callback_data="my_settings"),
         ],
         [
@@ -196,26 +167,10 @@ def get_main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("❓ Help", callback_data="help_menu"),
         ],
         [
-            InlineKeyboardButton("⭐ Rate Bot", url="https://t.me/OWNERxMod1"),
+            InlineKeyboardButton("📢 About", callback_data="about_menu"),
+            InlineKeyboardButton("⭐ Rate", url="https://t.me/OWNERxMod1"),
         ]
     ]
-    return InlineKeyboardMarkup(keyboard)
-
-# ----------------------------------------------------------------------
-# VOICE SELECTION BUTTONS
-# ----------------------------------------------------------------------
-def get_voice_menu() -> InlineKeyboardMarkup:
-    """Voice selection menu"""
-    keyboard = []
-    row = []
-    for i, (name, _) in enumerate(VOICES.items(), 1):
-        row.append(InlineKeyboardButton(f"{i}", callback_data=f"voice_{i}"))
-        if len(row) == 4:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 # ----------------------------------------------------------------------
@@ -224,51 +179,46 @@ def get_voice_menu() -> InlineKeyboardMarkup:
 def get_speed_menu() -> InlineKeyboardMarkup:
     """Speed selection menu"""
     speeds = [
-        ("🐢 Very Slow", "-50%"),
-        ("⏸️ Slow", "-25%"),
-        ("▶️ Normal", "+0%"),
-        ("⏩ Fast", "+25%"),
-        ("🚀 Very Fast", "+50%"),
+        ("🐢 Very Slow", "veryslow"),
+        ("⏸️ Slow", "slow"),
+        ("▶️ Normal", "normal"),
+        ("⏩ Fast", "fast"),
+        ("🚀 Very Fast", "veryfast"),
     ]
     keyboard = []
     for label, value in speeds:
         keyboard.append([InlineKeyboardButton(label, callback_data=f"speed_{value}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 # ----------------------------------------------------------------------
-# THEME SELECTION BUTTONS
+# SPEED LABELS
 # ----------------------------------------------------------------------
-def get_theme_menu() -> InlineKeyboardMarkup:
-    """Theme selection menu"""
-    themes = [
-        ("🌙 Dark", "dark"),
-        ("☀️ Light", "light"),
-        ("🌈 Rainbow", "rainbow"),
-    ]
-    keyboard = []
-    for label, value in themes:
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"theme_{value}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
-    return InlineKeyboardMarkup(keyboard)
+SPEED_LABELS = {
+    'veryslow': '🐢 Very Slow',
+    'slow': '⏸️ Slow',
+    'normal': '▶️ Normal',
+    'fast': '⏩ Fast',
+    'veryfast': '🚀 Very Fast'
+}
 
 # ----------------------------------------------------------------------
 # START COMMAND
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message with menu buttons"""
+    """Welcome message"""
     user = update.effective_user
     welcome_text = (
-        f"🎙️ <b>{BOT_NAME}</b>\n"
+        f"🎙️ <b>{BOT_NAME}</b> v{BOT_VERSION}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"👋 Hello {user.first_name}!\n\n"
         f"📨 <b>Send any text message</b>\n"
         f"🔊 I'll convert it to voice\n\n"
         f"✨ <b>Features:</b>\n"
-        f"• 400+ Voices (Hindi/English/Hinglish)\n"
-        f"• 😊 Emotion Detection\n"
-        f"• ⚡ Speed Control\n"
-        f"• 🎨 Themes (Dark/Light/Rainbow)\n"
+        f"• 🇮🇳 Hindi / 🇬🇧 English / 🔄 Hinglish\n"
+        f"• 😊 Emotion Detection (Happy/Sad)\n"
+        f"• ⚡ 5 Speed Settings\n"
+        f"• 📝 Auto-split long texts\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>👨‍💻 Owner:</b> {OWNER_NAME}\n"
         f"<b>📱 Contact:</b> {OWNER_CONTACT}"
@@ -290,15 +240,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🎯 <b>How to use:</b>\n"
         "• Send any text → Get voice\n"
         "• Emotions auto-detected\n\n"
-        "🎤 <b>Change Voice:</b>\n"
-        "• Click 'Change Voice' from menu\n"
-        "• Choose from 12+ voices\n\n"
         "⚡ <b>Speed Control:</b>\n"
-        "• 5 speed options (Very Slow to Very Fast)\n"
-        "• Important text → auto slow\n\n"
-        "🎨 <b>Themes:</b>\n"
-        "• Dark, Light, Rainbow\n"
-        "• Change from menu\n\n"
+        "• 5 speed options available\n"
+        "• Click 'Speed Control' from menu\n\n"
+        "😊 <b>Emotion Detection:</b>\n"
+        "• Happy words → ! (excited tone)\n"
+        "• Sad words → ... (soft tone)\n\n"
+        "📝 <b>Long Text:</b>\n"
+        "• Auto-split into multiple voices\n"
+        "• Progress indicator shown\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"👨‍💻 <b>Owner:</b> {OWNER_NAME}\n"
         f"📱 <b>Contact:</b> {OWNER_CONTACT}"
@@ -317,20 +267,23 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     about_text = (
         f"🤖 <b>{BOT_NAME}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>📌 Version:</b> 3.0 (Edge TTS)\n"
+        f"<b>📌 Version:</b> {BOT_VERSION}\n"
+        f"<b>📅 Updated:</b> July 2026\n\n"
         f"<b>🔧 Technology:</b>\n"
-        f"• Python + Edge TTS\n"
-        f"• 400+ Voice Support\n"
-        f"• Hindi/Hinglish/English\n\n"
+        f"• Python 3.11+\n"
+        f"• Google TTS (gTTS)\n"
+        f"• Telegram Bot API\n\n"
         f"<b>✨ Features:</b>\n"
-        f"• 🎤 Multiple Voices\n"
+        f"• 🇮🇳 Hindi Support\n"
+        f"• 🇬🇧 English Support\n"
+        f"• 🔄 Hinglish Support\n"
+        f"• 😊 Emotion Detection\n"
         f"• ⚡ Speed Control\n"
-        f"• 🎨 Themes\n"
-        f"• 📊 User Settings\n\n"
+        f"• 📝 Auto Split\n"
+        f"• 🎨 Interactive Menu\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>👨‍💻 Owner:</b> {OWNER_NAME}\n"
-        f"<b>📱 Contact:</b> {OWNER_CONTACT}\n"
-        f"<b>⭐ Rate:</b> @OWNERxMod1"
+        f"<b>📱 Contact:</b> {OWNER_CONTACT}"
     )
     await update.message.reply_text(
         about_text,
@@ -348,13 +301,18 @@ async def owner_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>📛 Name:</b> {OWNER_NAME}\n"
         f"<b>📱 Telegram:</b> {OWNER_CONTACT}\n"
-        f"<b>🌐 Brand:</b> DRIFT VOICE\n\n"
+        f"<b>🌐 Brand:</b> DRIFT VOICE\n"
+        f"<b>📌 Role:</b> Developer & Founder\n\n"
         f"💡 <b>Services:</b>\n"
-        f"• Bot Development\n"
-        f"• Telegram Automation\n"
-        f"• AI Integration\n\n"
+        f"• Telegram Bot Development\n"
+        f"• AI & Automation\n"
+        f"• Custom Solutions\n\n"
+        f"📩 <b>Contact for:</b>\n"
+        f"• Bot Requests\n"
+        f"• Support\n"
+        f"• Collaboration\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📩 <b>Contact:</b> {OWNER_CONTACT}"
+        f"📩 <b>DM:</b> {OWNER_CONTACT}"
     )
     await update.message.reply_text(
         owner_text,
@@ -390,9 +348,8 @@ async def text_to_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lang = detect_language(text)
     lang_name = "Hindi" if lang == 'hi' else "English"
     
-    # User settings
-    voice_name = user_voices.get(user_id, DEFAULT_VOICE)
-    speed = user_speeds.get(user_id, '+0%')
+    # Get speed setting
+    speed = user_speeds.get(user_id, 'normal')
     
     # Split text
     chunks = split_text(text)
@@ -402,26 +359,51 @@ async def text_to_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     # Progress indicator
     if len(chunks) > 1:
-        voice_label = list(VOICES.keys())[list(VOICES.values()).index(voice_name)]
         await update.message.reply_text(
             f"📤 Sending {len(chunks)} voice messages...\n"
             f"🌐 Language: {lang_name}\n"
-            f"🎤 Voice: {voice_label}"
+            f"⚡ Speed: {SPEED_LABELS.get(speed, 'Normal')}"
         )
     
     # Generate and send each chunk
     for i, chunk in enumerate(chunks, 1):
-        audio_path = await generate_voice(chunk, voice_name, speed)
-        if not audio_path:
-            await update.message.reply_text(f"❌ Chunk {i} generation failed.")
-            continue
-        
         try:
-            with open(audio_path, 'rb') as audio_file:
-                caption = f"📝 {i}/{len(chunks)}" if len(chunks) > 1 else None
-                await update.message.reply_voice(voice=audio_file, caption=caption)
-            os.unlink(audio_path)
+            # Speed control: adjust chunk size
+            if speed == 'veryslow':
+                # Split into very small chunks
+                sub_chunks = split_text(chunk, max_len=200)
+                for sub_chunk in sub_chunks:
+                    audio_path = generate_voice(sub_chunk, lang)
+                    with open(audio_path, 'rb') as audio_file:
+                        await update.message.reply_voice(voice=audio_file)
+                    os.unlink(audio_path)
+            elif speed == 'slow':
+                # Split into smaller chunks
+                sub_chunks = split_text(chunk, max_len=400)
+                for sub_chunk in sub_chunks:
+                    audio_path = generate_voice(sub_chunk, lang)
+                    with open(audio_path, 'rb') as audio_file:
+                        await update.message.reply_voice(voice=audio_file)
+                    os.unlink(audio_path)
+            elif speed == 'fast':
+                # Normal chunks but faster speech (gTTS slow=False)
+                audio_path = generate_voice(chunk, lang)
+                with open(audio_path, 'rb') as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                os.unlink(audio_path)
+            elif speed == 'veryfast':
+                # Normal chunks, combine for faster delivery
+                audio_path = generate_voice(chunk, lang)
+                with open(audio_path, 'rb') as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                os.unlink(audio_path)
+            else:  # normal
+                audio_path = generate_voice(chunk, lang)
+                with open(audio_path, 'rb') as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                os.unlink(audio_path)
             
+            # Progress update
             if len(chunks) > 1 and i % 2 == 0 and i < len(chunks):
                 await update.message.reply_text(f"📦 Progress: {i}/{len(chunks)}")
                 
@@ -452,59 +434,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
-    # Change voice
-    if data == "change_voice":
-        current_voice = user_voices.get(user_id, DEFAULT_VOICE)
-        current_label = list(VOICES.keys())[list(VOICES.values()).index(current_voice)]
-        await query.edit_message_text(
-            f"🎤 <b>Select Voice:</b>\n"
-            f"Click the button number to change:\n\n"
-            f"<i>Current Voice: {current_label}</i>\n\n"
-            f"<b>Available Voices:</b>\n"
-            + "\n".join([f"• {i+1}. {name}" for i, name in enumerate(VOICES.keys())]),
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_voice_menu()
-        )
-        return
-    
     # Change speed
     if data == "change_speed":
-        speed = user_speeds.get(user_id, '+0%')
+        current_speed = user_speeds.get(user_id, 'normal')
         await query.edit_message_text(
             f"⚡ <b>Select Speed:</b>\n"
-            f"<i>Current Speed: {speed}</i>\n\n"
-            "🐢 Very Slow → 🚀 Very Fast",
+            f"<i>Current Speed: {SPEED_LABELS.get(current_speed, 'Normal')}</i>\n\n"
+            f"🐢 Very Slow → 🚀 Very Fast\n"
+            f"<i>Note: Speed affects voice quality</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=get_speed_menu()
         )
         return
     
-    # Change theme
-    if data == "change_theme":
-        theme = user_themes.get(user_id, 'light')
-        await query.edit_message_text(
-            f"🎨 <b>Select Theme:</b>\n"
-            f"<i>Current Theme: {theme}</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_theme_menu()
-        )
-        return
-    
     # My settings
     if data == "my_settings":
-        voice_name = user_voices.get(user_id, DEFAULT_VOICE)
-        voice_label = list(VOICES.keys())[list(VOICES.values()).index(voice_name)]
-        speed = user_speeds.get(user_id, '+0%')
-        theme = user_themes.get(user_id, 'light')
-        
+        speed = user_speeds.get(user_id, 'normal')
         settings_text = (
             f"📊 <b>Your Settings</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎤 Voice: {voice_label}\n"
-            f"⚡ Speed: {speed}\n"
-            f"🎨 Theme: {theme}\n"
+            f"⚡ Speed: {SPEED_LABELS.get(speed, 'Normal')}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 Change from menu above"
+            f"💡 Change settings from menu above"
         )
         await query.edit_message_text(
             settings_text,
@@ -535,7 +486,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
-       # Help menu
+    # Help menu
     if data == "help_menu":
         help_text = (
             "📚 <b>DRIFT VOICE - User Guide</b>\n"
@@ -543,9 +494,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "🎯 <b>How to use:</b>\n"
             "• Send any text → Get voice\n"
             "• Emotions auto-detected\n\n"
-            "🎤 <b>Voice:</b> 12+ options\n"
             "⚡ <b>Speed:</b> 5 options\n"
-            "🎨 <b>Theme:</b> 3 options"
+            "😊 <b>Emotions:</b> Happy/Sad\n"
+            "📝 <b>Long Text:</b> Auto-split\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👨‍💻 <b>Owner:</b> {OWNER_NAME}"
         )
         await query.edit_message_text(
             help_text,
@@ -554,21 +507,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
-    # Voice select
-    if data.startswith("voice_"):
-        index = int(data.split("_")[1]) - 1
-        voice_names = list(VOICES.keys())
-        if 0 <= index < len(voice_names):
-            selected_voice = voice_names[index]
-            voice_value = VOICES[selected_voice]
-            user_voices[user_id] = voice_value
-            await query.edit_message_text(
-                f"✅ Voice changed successfully!\n"
-                f"🎤 <b>{selected_voice}</b>\n\n"
-                f"Send any text to hear the new voice!",
-                parse_mode=ParseMode.HTML,
-                reply_markup=get_main_menu()
-            )
+    # About menu
+    if data == "about_menu":
+        about_text = (
+            f"🤖 <b>{BOT_NAME}</b> v{BOT_VERSION}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>🔧 Technology:</b>\n"
+            f"• Python + gTTS\n"
+            f"• Telegram Bot API\n\n"
+            f"<b>✨ Features:</b>\n"
+            f"• Hindi/English/Hinglish\n"
+            f"• Emotion Detection\n"
+            f"• Speed Control\n"
+            f"• Auto Split\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>👨‍💻 Owner:</b> {OWNER_NAME}"
+        )
+        await query.edit_message_text(
+            about_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
         return
     
     # Speed select
@@ -577,21 +536,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_speeds[user_id] = speed
         await query.edit_message_text(
             f"✅ Speed changed successfully!\n"
-            f"⚡ <b>{speed}</b>\n\n"
+            f"⚡ <b>{SPEED_LABELS.get(speed, 'Normal')}</b>\n\n"
             f"Send any text to hear the new speed!",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_main_menu()
-        )
-        return
-    
-    # Theme select
-    if data.startswith("theme_"):
-        theme = data.split("_")[1]
-        user_themes[user_id] = theme
-        await query.edit_message_text(
-            f"✅ Theme changed successfully!\n"
-            f"🎨 <b>{theme}</b>\n\n"
-            f"<i>Theme will apply on restart</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_menu()
         )
@@ -603,33 +549,39 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     """Start the bot"""
     if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: Bot token not set!")
+        print("❌ ERROR: Please set your bot token!")
+        print("📝 TOKEN = 'YOUR_BOT_TOKEN_HERE' ko apne token se badlein")
         return
     
-    # Build application
-    app = Application.builder().token(TOKEN).build()
+    print("🚀 Starting DRIFT VOICE BOT...")
+    print(f"📦 Version: {BOT_VERSION}")
+    print(f"👨‍💻 Owner: {OWNER_NAME}")
+    print(f"📱 Contact: {OWNER_CONTACT}")
     
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("about", about_command))
-    app.add_handler(CommandHandler("owner", owner_info))
-    
-    # Message handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_voice))
-    
-    # Callback handler for buttons
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Start bot
-    print("🎙️ DRIFT VOICE BOT STARTED!")
-    print("👨‍💻 Owner: Pravin Kewat")
-    print("📱 Contact: @OWNERxMod1")
-    print("🌐 Languages: Hindi + English + Hinglish")
-    print("🎤 400+ Voices (Edge TTS)")
-    print("📡 Polling started...")
-    
-    app.run_polling()
+    try:
+        app = Application.builder().token(TOKEN).build()
+        
+        # Command handlers
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("about", about_command))
+        app.add_handler(CommandHandler("owner", owner_info))
+        
+        # Message handler
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_voice))
+        
+        # Callback handler for buttons
+        app.add_handler(CallbackQueryHandler(button_callback))
+        
+        print("🎙️ Bot is running...")
+        print("🌐 Languages: Hindi + English + Hinglish")
+        print("📡 Polling started...")
+        
+        app.run_polling()
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise
 
 # ----------------------------------------------------------------------
 # ENTRY POINT
