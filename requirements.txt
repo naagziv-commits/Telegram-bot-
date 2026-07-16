@@ -1,2 +1,3 @@
 python-telegram-bot==21.0
-gTTS==2.3.2
+edge-tts==6.1.9
+asyncio==3.4.3
