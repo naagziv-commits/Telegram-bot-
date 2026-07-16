@@ -1,101 +1,102 @@
 import os
 import re
 import tempfile
+import asyncio
 from time import time
 from collections import defaultdict
-from typing import List
+from typing import List, Optional
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from gtts import gTTS
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    CallbackQueryHandler, filters, ContextTypes
+)
+from telegram.constants import ParseMode
+import edge_tts
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
-TOKEN = "8821679689:AAGUsUZkl2SqlreyHdHaxeFdorpuflP_8f0"  # BotFather से अपना टोकन डालें
-MAX_CHUNK_LEN = 1000           # प्रति ऑडियो चंक अक्षर (gTTS के लिए सुरक्षित)
-MAX_TEXT_LENGTH = 5000         # अधिकतम टेक्स्ट लंबाई
-COOLDOWN_SECONDS = 3           # यूज़र कूलडाउन (सेकंड)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8821679689:AAGUsUZkl2SqlreyHdHaxeFdorpuflP_8f0")
+MAX_CHUNK_LEN = 1000
+MAX_TEXT_LENGTH = 5000
+COOLDOWN_SECONDS = 3
 
-# Rate limiting storage
-user_cooldowns = defaultdict(float)
+# Branding
+BOT_NAME = "🎙️ DRIFT VOICE"
+OWNER_NAME = "Pravin Kewat"
+OWNER_CONTACT = "@OWNERxMod1"
 
 # ----------------------------------------------------------------------
-# LANGUAGE DETECTION (हिंदी/हिंग्लिश/अंग्रेज़ी)
+# VOICE CONFIGURATION (Edge TTS)
+# ----------------------------------------------------------------------
+VOICES = {
+    "Hindi Female": "hi-IN-SwaraNeural",
+    "Hindi Male": "hi-IN-MadhurNeural",
+    "Hinglish Female": "en-IN-NeerjaNeural",
+    "Hinglish Male": "en-IN-PrabhatNeural",
+    "English US Female": "en-US-JennyNeural",
+    "English US Male": "en-US-GuyNeural",
+    "English UK Female": "en-GB-SoniaNeural",
+    "English UK Male": "en-GB-RyanNeural",
+    "Japanese Female": "ja-JP-NanamiNeural",
+    "Spanish Female": "es-ES-ElviraNeural",
+    "French Female": "fr-FR-DeniseNeural",
+    "German Female": "de-DE-KatjaNeural",
+}
+
+DEFAULT_VOICE = "hi-IN-SwaraNeural"
+
+# User data storage
+user_cooldowns = defaultdict(float)
+user_voices = defaultdict(str)
+user_speeds = defaultdict(str)  # user_id -> speed
+user_themes = defaultdict(str)
+
+# ----------------------------------------------------------------------
+# LANGUAGE DETECTION
 # ----------------------------------------------------------------------
 def detect_language(text: str) -> str:
-    """
-    भाषा डिटेक्ट करें:
-    - 'hi' हिंदी के लिए (देवनागरी या हिंग्लिश)
-    - 'en' अंग्रेज़ी के लिए
-    """
-    # अगर देवनागरी है तो हिंदी
+    """Detect language for TTS"""
     if re.search(r'[\u0900-\u097F]', text):
         return 'hi'
     
-    # हिंग्लिश कीवर्ड (रोमन में लिखी हिंदी)
-    hinglish_keywords = [
-        'aap', 'main', 'tum', 'hum', 'hai', 'hain', 'kya', 'kaise', 
-        'bahut', 'thoda', 'acha', 'accha', 'sahi', 'galat', 'nahi',
-        'haan', 'ji', 'na', 'ho', 'hoga', 'raha', 'rahi', 'rahe',
-        'sakta', 'sakti', 'sakte', 'chahiye', 'kar', 'karo', 'kare'
-    ]
-    
+    hinglish_keywords = ['aap', 'main', 'tum', 'hum', 'hai', 'hain', 'kya', 
+                         'kaise', 'bahut', 'thoda', 'acha', 'accha', 'sahi']
     words = text.lower().split()
     if not words:
         return 'en'
-    
     hinglish_count = sum(1 for w in words if w in hinglish_keywords)
-    # अगर 20% से ज्यादा हिंग्लिश है
     if hinglish_count > len(words) * 0.2:
         return 'hi'
-    
     return 'en'
 
 # ----------------------------------------------------------------------
-# TEXT CLEANING (हिंदी टेक्स्ट साफ करें)
+# TEXT CLEANING
 # ----------------------------------------------------------------------
 def clean_text(text: str) -> str:
-    """टेक्स्ट को साफ करें - अतिरिक्त स्पेस और विराम चिह्न ठीक करें"""
-    # अतिरिक्त स्पेस हटाएं
+    """Clean text - remove extra spaces and fix punctuation"""
     text = re.sub(r'\s+', ' ', text)
-    # हिंदी पूर्ण विराम को अंग्रेज़ी में बदलें
     text = re.sub(r'[।]', '.', text)
-    # हिंदी प्रश्न चिह्न
-    text = re.sub(r'[?]', '?', text)
-    # हिंदी विस्मयादिबोधक
-    text = re.sub(r'[!]', '!', text)
     return text.strip()
 
 # ----------------------------------------------------------------------
-# EMOTION & PAUSE ENHANCEMENT (भावना आधारित विराम)
+# EMOTION DETECTION
 # ----------------------------------------------------------------------
 def add_emotion_pauses(text: str) -> str:
-    """
-    भावना के अनुसार विराम चिह्न और इमोजी जोड़ें
-    खुशी = ! 😊, उदासी = ... 😔
-    """
-    # हिंदी + अंग्रेज़ी हैप्पी कीवर्ड
+    """Add emotion-based punctuation"""
     happy_keywords = [
         'खुश', 'मस्त', 'बढ़िया', 'शानदार', 'अच्छा', 'लव', 'प्यार',
-        'हैप्पी', 'ग्रेट', 'वंडरफुल', 'एक्साइटेड', 'मज़ा', 'धमाका',
-        'जिंदाबाद', 'वाह', 'कमाल', 'सुपर', 'फन', 'एंजॉय',
-        'happy', 'great', 'awesome', 'love', 'wonderful', 'excited',
-        'amazing', 'fantastic', 'cool', 'yay', 'woohoo', 'best'
+        'happy', 'great', 'awesome', 'love', 'wonderful', 'amazing',
+        'excited', 'fantastic', 'cool', 'yay'
     ]
-    
-    # हिंदी + अंग्रेज़ी सैड कीवर्ड
     sad_keywords = [
-        'दुखी', 'उदास', 'बुरा', 'अकेला', 'रोना', 'दर्द', 'गम',
-        'सैड', 'सॉरी', 'डिप्रेस्ड', 'हर्ट', 'तकलीफ', 'परेशान',
-        'निराश', 'मायूस', 'फिक्र', 'चिंता',
-        'sad', 'unhappy', 'sorry', 'depressed', 'hurt', 'cry', 'alone',
-        'pain', 'suffering', 'worried', 'anxious', 'upset'
+        'दुखी', 'उदास', 'बुरा', 'अकेला', 'रोना', 'दर्द',
+        'sad', 'unhappy', 'sorry', 'depressed', 'hurt', 'cry',
+        'alone', 'pain', 'suffering'
     ]
     
     lower_text = text.lower()
-    
-    # पहले से कोई विराम चिह्न है?
     has_punctuation = text.rstrip().endswith(('!', '?', '.', '...'))
     
     if any(kw in lower_text for kw in happy_keywords):
@@ -112,14 +113,10 @@ def add_emotion_pauses(text: str) -> str:
     return clean_text(text)
 
 # ----------------------------------------------------------------------
-# TEXT SPLITTING (वाक्य आधारित टेक्स्ट तोड़ें)
+# TEXT SPLITTING
 # ----------------------------------------------------------------------
 def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
-    """
-    लंबे टेक्स्ट को छोटे चंक्स में तोड़ें
-    वाक्यों को सुरक्षित रखते हुए
-    """
-    # हिंदी और अंग्रेज़ी दोनों के लिए
+    """Split long text into smaller chunks preserving sentences"""
     sentences = re.split(r'(?<=[.!?।])\s+', text)
     chunks = []
     current_chunk = ""
@@ -127,7 +124,6 @@ def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
     for sent in sentences:
         if not sent:
             continue
-            
         if len(current_chunk) + len(sent) + 1 <= max_len:
             if current_chunk:
                 current_chunk += " " + sent
@@ -136,9 +132,7 @@ def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
         else:
             if current_chunk:
                 chunks.append(current_chunk)
-            # अगर एक वाक्य भी मैक्स लिमिट से बड़ा है
             if len(sent) > max_len:
-                # शब्दों के हिसाब से तोड़ें
                 words = sent.split()
                 temp = ""
                 for word in words:
@@ -157,229 +151,482 @@ def split_text(text: str, max_len: int = MAX_CHUNK_LEN) -> List[str]:
                     current_chunk = ""
             else:
                 current_chunk = sent
-    
     if current_chunk:
         chunks.append(current_chunk)
-    
     return chunks
 
 # ----------------------------------------------------------------------
-# GET SPEECH SPEED (भाषण की गति)
+# EDGE TTS VOICE GENERATOR
 # ----------------------------------------------------------------------
-def get_speech_speed(text: str) -> bool:
-    """
-    टेक्स्ट के आधार पर स्पीड तय करें
-    True = धीरे, False = सामान्य
-    """
-    slow_keywords = ['ध्यान', 'गंभीर', 'महत्वपूर्ण', 'careful', 'important',
-                     'serious', 'attention', 'सावधान', 'सचेत']
-    return any(kw in text.lower() for kw in slow_keywords)
+async def generate_voice(text: str, voice_name: str = DEFAULT_VOICE, rate: str = "+0%") -> Optional[str]:
+    """Generate voice using Edge TTS"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp_path = tmp.name
+        
+        communicate = edge_tts.Communicate(text, voice_name, rate=rate)
+        await communicate.save(tmp_path)
+        
+        # Check file size (Telegram 50MB limit)
+        if os.path.getsize(tmp_path) > 50 * 1024 * 1024:
+            os.unlink(tmp_path)
+            return None
+        
+        return tmp_path
+    except Exception as e:
+        print(f"❌ TTS Error: {e}")
+        return None
 
 # ----------------------------------------------------------------------
-# VOICE MESSAGE HANDLER (मुख्य फंक्शन)
+# MAIN MENU BUTTONS
+# ----------------------------------------------------------------------
+def get_main_menu() -> InlineKeyboardMarkup:
+    """Main menu buttons"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🎤 Change Voice", callback_data="change_voice"),
+            InlineKeyboardButton("⚡ Speed Control", callback_data="change_speed"),
+        ],
+        [
+            InlineKeyboardButton("🎨 Theme", callback_data="change_theme"),
+            InlineKeyboardButton("📊 My Settings", callback_data="my_settings"),
+        ],
+        [
+            InlineKeyboardButton("👨‍💻 Owner", callback_data="owner_info"),
+            InlineKeyboardButton("❓ Help", callback_data="help_menu"),
+        ],
+        [
+            InlineKeyboardButton("⭐ Rate Bot", url="https://t.me/OWNERxMod1"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ----------------------------------------------------------------------
+# VOICE SELECTION BUTTONS
+# ----------------------------------------------------------------------
+def get_voice_menu() -> InlineKeyboardMarkup:
+    """Voice selection menu"""
+    keyboard = []
+    row = []
+    for i, (name, _) in enumerate(VOICES.items(), 1):
+        row.append(InlineKeyboardButton(f"{i}", callback_data=f"voice_{i}"))
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ----------------------------------------------------------------------
+# SPEED SELECTION BUTTONS
+# ----------------------------------------------------------------------
+def get_speed_menu() -> InlineKeyboardMarkup:
+    """Speed selection menu"""
+    speeds = [
+        ("🐢 Very Slow", "-50%"),
+        ("⏸️ Slow", "-25%"),
+        ("▶️ Normal", "+0%"),
+        ("⏩ Fast", "+25%"),
+        ("🚀 Very Fast", "+50%"),
+    ]
+    keyboard = []
+    for label, value in speeds:
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"speed_{value}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ----------------------------------------------------------------------
+# THEME SELECTION BUTTONS
+# ----------------------------------------------------------------------
+def get_theme_menu() -> InlineKeyboardMarkup:
+    """Theme selection menu"""
+    themes = [
+        ("🌙 Dark", "dark"),
+        ("☀️ Light", "light"),
+        ("🌈 Rainbow", "rainbow"),
+    ]
+    keyboard = []
+    for label, value in themes:
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"theme_{value}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ----------------------------------------------------------------------
+# START COMMAND
+# ----------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome message with menu buttons"""
+    user = update.effective_user
+    welcome_text = (
+        f"🎙️ <b>{BOT_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👋 Hello {user.first_name}!\n\n"
+        f"📨 <b>Send any text message</b>\n"
+        f"🔊 I'll convert it to voice\n\n"
+        f"✨ <b>Features:</b>\n"
+        f"• 400+ Voices (Hindi/English/Hinglish)\n"
+        f"• 😊 Emotion Detection\n"
+        f"• ⚡ Speed Control\n"
+        f"• 🎨 Themes (Dark/Light/Rainbow)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>👨‍💻 Owner:</b> {OWNER_NAME}\n"
+        f"<b>📱 Contact:</b> {OWNER_CONTACT}"
+    )
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_menu()
+    )
+
+# ----------------------------------------------------------------------
+# HELP COMMAND
+# ----------------------------------------------------------------------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Help menu"""
+    help_text = (
+        "📚 <b>DRIFT VOICE - User Guide</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 <b>How to use:</b>\n"
+        "• Send any text → Get voice\n"
+        "• Emotions auto-detected\n\n"
+        "🎤 <b>Change Voice:</b>\n"
+        "• Click 'Change Voice' from menu\n"
+        "• Choose from 12+ voices\n\n"
+        "⚡ <b>Speed Control:</b>\n"
+        "• 5 speed options (Very Slow to Very Fast)\n"
+        "• Important text → auto slow\n\n"
+        "🎨 <b>Themes:</b>\n"
+        "• Dark, Light, Rainbow\n"
+        "• Change from menu\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👨‍💻 <b>Owner:</b> {OWNER_NAME}\n"
+        f"📱 <b>Contact:</b> {OWNER_CONTACT}"
+    )
+    await update.message.reply_text(
+        help_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_menu()
+    )
+
+# ----------------------------------------------------------------------
+# ABOUT COMMAND
+# ----------------------------------------------------------------------
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """About bot"""
+    about_text = (
+        f"🤖 <b>{BOT_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>📌 Version:</b> 3.0 (Edge TTS)\n"
+        f"<b>🔧 Technology:</b>\n"
+        f"• Python + Edge TTS\n"
+        f"• 400+ Voice Support\n"
+        f"• Hindi/Hinglish/English\n\n"
+        f"<b>✨ Features:</b>\n"
+        f"• 🎤 Multiple Voices\n"
+        f"• ⚡ Speed Control\n"
+        f"• 🎨 Themes\n"
+        f"• 📊 User Settings\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>👨‍💻 Owner:</b> {OWNER_NAME}\n"
+        f"<b>📱 Contact:</b> {OWNER_CONTACT}\n"
+        f"<b>⭐ Rate:</b> @OWNERxMod1"
+    )
+    await update.message.reply_text(
+        about_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_menu()
+    )
+
+# ----------------------------------------------------------------------
+# OWNER INFO
+# ----------------------------------------------------------------------
+async def owner_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner information"""
+    owner_text = (
+        f"👨‍💻 <b>Owner Information</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>📛 Name:</b> {OWNER_NAME}\n"
+        f"<b>📱 Telegram:</b> {OWNER_CONTACT}\n"
+        f"<b>🌐 Brand:</b> DRIFT VOICE\n\n"
+        f"💡 <b>Services:</b>\n"
+        f"• Bot Development\n"
+        f"• Telegram Automation\n"
+        f"• AI Integration\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📩 <b>Contact:</b> {OWNER_CONTACT}"
+    )
+    await update.message.reply_text(
+        owner_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_menu()
+    )
+
+# ----------------------------------------------------------------------
+# VOICE MESSAGE HANDLER
 # ----------------------------------------------------------------------
 async def text_to_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """टेक्स्ट मैसेज को वॉइस में बदलें और भेजें"""
-    
+    """Convert text to voice"""
     user_id = update.effective_user.id
     
-    # Rate limiting - स्पैम रोकें
+    # Rate limiting
     if time() - user_cooldowns[user_id] < COOLDOWN_SECONDS:
-        await update.message.reply_text("⏳ थोड़ा रुकें! कृपया कुछ सेकंड बाद फिर भेजें।")
+        await update.message.reply_text("⏳ Please wait 3 seconds before sending again.")
         return
     user_cooldowns[user_id] = time()
     
-    # टेक्स्ट प्राप्त करें
     text = update.message.text.strip()
-    
-    # कमांड को इग्नोर करें (अलग से हैंडल होते हैं)
-    if text.startswith('/'):
+    if not text or text.startswith('/'):
         return
     
-    # खाली टेक्स्ट चेक
-    if not text:
-        await update.message.reply_text("❌ कृपया वैध टेक्स्ट भेजें।")
-        return
-    
-    # लंबाई की जाँच
     if len(text) > MAX_TEXT_LENGTH:
-        await update.message.reply_text(
-            f"❌ टेक्स्ट बहुत लंबा है! अधिकतम {MAX_TEXT_LENGTH} अक्षर।\n"
-            f"आपके टेक्स्ट में {len(text)} अक्षर हैं।"
-        )
+        await update.message.reply_text(f"❌ Text too long! Max {MAX_TEXT_LENGTH} characters.")
         return
     
-    # भावना और विराम जोड़ें
+    # Add emotion
     text = add_emotion_pauses(text)
     
-    # भाषा डिटेक्ट करें
+    # Detect language
     lang = detect_language(text)
-    lang_name = "हिंदी" if lang == 'hi' else "अंग्रेज़ी"
+    lang_name = "Hindi" if lang == 'hi' else "English"
     
-    # टेक्स्ट को चंक्स में तोड़ें
+    # User settings
+    voice_name = user_voices.get(user_id, DEFAULT_VOICE)
+    speed = user_speeds.get(user_id, '+0%')
+    
+    # Split text
     chunks = split_text(text)
     if not chunks:
-        await update.message.reply_text("❌ टेक्स्ट प्रोसेस नहीं हो पाया।")
+        await update.message.reply_text("❌ Could not process text.")
         return
     
-    # प्रोग्रेस इंडिकेटर
+    # Progress indicator
     if len(chunks) > 1:
+        voice_label = list(VOICES.keys())[list(VOICES.values()).index(voice_name)]
         await update.message.reply_text(
-            f"📤 {len(chunks)} वॉइस मैसेज भेज रहा हूँ...\n"
-            f"🌐 भाषा: {lang_name}"
+            f"📤 Sending {len(chunks)} voice messages...\n"
+            f"🌐 Language: {lang_name}\n"
+            f"🎤 Voice: {voice_label}"
         )
     
-    # हर चंक के लिए वॉइस जनरेट करें
+    # Generate and send each chunk
     for i, chunk in enumerate(chunks, 1):
+        audio_path = await generate_voice(chunk, voice_name, speed)
+        if not audio_path:
+            await update.message.reply_text(f"❌ Chunk {i} generation failed.")
+            continue
+        
         try:
-            # टेम्पोररी फाइल बनाएं
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                tmp_path = tmp.name
+            with open(audio_path, 'rb') as audio_file:
+                caption = f"📝 {i}/{len(chunks)}" if len(chunks) > 1 else None
+                await update.message.reply_voice(voice=audio_file, caption=caption)
+            os.unlink(audio_path)
             
-            # स्पीड तय करें
-            slow = get_speech_speed(chunk)
-            
-            # gTTS से वॉइस जनरेट करें
-            tts = gTTS(text=chunk, lang=lang, slow=slow)
-            tts.save(tmp_path)
-            
-            # फाइल साइज चेक करें (Telegram की सीमा 50MB)
-            file_size = os.path.getsize(tmp_path) / (1024 * 1024)  # MB में
-            if file_size > 50:
-                await update.message.reply_text(
-                    f"⚠️ चंक {i} बहुत बड़ा है ({file_size:.1f}MB)।\n"
-                    f"कृपया टेक्स्ट छोटा करें।"
-                )
-                os.unlink(tmp_path)
-                continue
-            
-            # वॉइस मैसेज भेजें
-            with open(tmp_path, 'rb') as audio_file:
-                await update.message.reply_voice(
-                    voice=audio_file,
-                    caption=f"📝 चंक {i}/{len(chunks)}" if len(chunks) > 1 else None
-                )
-            
-            # टेम्पोरेरी फाइल डिलीट करें
-            os.unlink(tmp_path)
-            
-            # प्रोग्रेस अपडेट (हर 2 चंक पर)
             if len(chunks) > 1 and i % 2 == 0 and i < len(chunks):
-                await update.message.reply_text(f"📦 प्रोग्रेस: {i}/{len(chunks)}")
+                await update.message.reply_text(f"📦 Progress: {i}/{len(chunks)}")
                 
         except Exception as e:
-            error_msg = str(e)
-            await update.message.reply_text(
-                f"❌ त्रुटि (चंक {i}): {error_msg}\n"
-                f"कृपया फिर से प्रयास करें।"
-            )
-            # फाइल क्लीनअप
+            await update.message.reply_text(f"❌ Error: {str(e)}")
             try:
-                os.unlink(tmp_path)
+                os.unlink(audio_path)
             except:
                 pass
             return
 
 # ----------------------------------------------------------------------
-# START COMMAND (हिंदी में स्वागत)
+# CALLBACK QUERY HANDLER
 # ----------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start कमांड - हिंदी में स्वागत संदेश"""
-    welcome_text = (
-        "🎙️ <b>DRIFT टेक्स्ट टू वॉइस बॉट</b> <i>लाइव</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📨 <b>हिंदी या अंग्रेज़ी में टेक्स्ट भेजें</b> ✍️\n"
-        "🔊 <b>वॉइस मैसेज बनेगा</b> 🎧\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<code>✨ हिंग्लिश | नेचुरल इमोशन | पॉज़ ✨</code>\n\n"
-        "🇮🇳 <b>हिंदी, हिंग्लिश और अंग्रेज़ी सपोर्ट</b>\n"
-        "😊 <i>खुशी के शब्द → !</i>\n"
-        "😔 <i>उदासी के शब्द → ...</i>\n\n"
-        "💡 <b>टिप:</b> /help देखें"
-    )
-    await update.message.reply_text(welcome_text, parse_mode='HTML')
-
-# ----------------------------------------------------------------------
-# HELP COMMAND (हिंदी में मदद)
-# ----------------------------------------------------------------------
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/help कमांड - उपयोग गाइड"""
-    help_text = (
-        "📚 <b>कैसे इस्तेमाल करें</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ कोई भी टेक्स्ट भेजें\n"
-        "2️⃣ बॉट अपने आप भाषा पहचानेगा\n"
-        "3️⃣ वॉइस मैसेज जनरेट होगा\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌟 <b>फीचर्स</b>\n"
-        "• 🇮🇳 हिंदी / 🇬🇧 अंग्रेज़ी / 🔄 हिंग्लिश\n"
-        "• 😊😔 इमोशन डिटेक्शन\n"
-        "• 📝 लंबे टेक्स्ट का ऑटो-स्प्लिट\n"
-        "• ⏱️ रेट लिमिटिंग (3 सेकंड)\n"
-        "• 📊 प्रोग्रेस इंडिकेटर\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 <b>इमोशन कीवर्ड:</b>\n"
-        "😊 खुश, बढ़िया, शानदार, love, happy\n"
-        "😔 दुखी, उदास, बुरा, sad, sorry\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ <b>सीमाएं:</b>\n"
-        "• अधिकतम {MAX_TEXT_LENGTH} अक्षर\n"
-        "• 3 सेकंड का कूलडाउन\n"
-        "• 50MB फाइल साइज़ लिमिट\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>❓ किसी भी समस्या के लिए @DriftBotSupport</i>"
-    )
-    await update.message.reply_text(help_text, parse_mode='HTML')
-
-# ----------------------------------------------------------------------
-# ABOUT COMMAND (बॉट की जानकारी)
-# ----------------------------------------------------------------------
-async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/about - बॉट की जानकारी"""
-    about_text = (
-        "🤖 <b>DRIFT टेक्स्ट टू वॉइस बॉट</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 <b>वर्शन:</b> 2.0 (हिंदी अपडेट)\n"
-        "🔧 <b>टेक्नोलॉजी:</b>\n"
-        "• Python + python-telegram-bot\n"
-        "• Google Text-to-Speech (gTTS)\n"
-        "• हिंदी/हिंग्लिश सपोर्ट\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "👨‍💻 <b>डेवलपर:</b> Drift Tech\n"
-        "📅 <b>अपडेट:</b> 15 जुलाई 2026\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "⭐ <i>हिंदी में बोलना अब और आसान!</i>"
-    )
-    await update.message.reply_text(about_text, parse_mode='HTML')
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button clicks"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    data = query.data
+    
+    # Back to menu
+    if data == "back_menu":
+        await query.edit_message_text(
+            "🔙 Back to Main Menu!",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    # Change voice
+    if data == "change_voice":
+        current_voice = user_voices.get(user_id, DEFAULT_VOICE)
+        current_label = list(VOICES.keys())[list(VOICES.values()).index(current_voice)]
+        await query.edit_message_text(
+            f"🎤 <b>Select Voice:</b>\n"
+            f"Click the button number to change:\n\n"
+            f"<i>Current Voice: {current_label}</i>\n\n"
+            f"<b>Available Voices:</b>\n"
+            + "\n".join([f"• {i+1}. {name}" for i, name in enumerate(VOICES.keys())]),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_voice_menu()
+        )
+        return
+    
+    # Change speed
+    if data == "change_speed":
+        speed = user_speeds.get(user_id, '+0%')
+        await query.edit_message_text(
+            f"⚡ <b>Select Speed:</b>\n"
+            f"<i>Current Speed: {speed}</i>\n\n"
+            "🐢 Very Slow → 🚀 Very Fast",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_speed_menu()
+        )
+        return
+    
+    # Change theme
+    if data == "change_theme":
+        theme = user_themes.get(user_id, 'light')
+        await query.edit_message_text(
+            f"🎨 <b>Select Theme:</b>\n"
+            f"<i>Current Theme: {theme}</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_theme_menu()
+        )
+        return
+    
+    # My settings
+    if data == "my_settings":
+        voice_name = user_voices.get(user_id, DEFAULT_VOICE)
+        voice_label = list(VOICES.keys())[list(VOICES.values()).index(voice_name)]
+        speed = user_speeds.get(user_id, '+0%')
+        theme = user_themes.get(user_id, 'light')
+        
+        settings_text = (
+            f"📊 <b>Your Settings</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎤 Voice: {voice_label}\n"
+            f"⚡ Speed: {speed}\n"
+            f"🎨 Theme: {theme}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 Change from menu above"
+        )
+        await query.edit_message_text(
+            settings_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    # Owner info
+    if data == "owner_info":
+        owner_text = (
+            f"👨‍💻 <b>Owner Information</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>📛 Name:</b> {OWNER_NAME}\n"
+            f"<b>📱 Telegram:</b> {OWNER_CONTACT}\n"
+            f"<b>🌐 Brand:</b> DRIFT VOICE\n\n"
+            f"💡 <b>Services:</b>\n"
+            f"• Bot Development\n"
+            f"• Telegram Automation\n"
+            f"• AI Integration\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📩 <b>Contact:</b> {OWNER_CONTACT}"
+        )
+        await query.edit_message_text(
+            owner_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
+        return
+    
+       # Help menu
+    if data == "help_menu":
+        help_text = (
+            "📚 <b>DRIFT VOICE - User Guide</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎯 <b>How to use:</b>\n"
+            "• Send any text → Get voice\n"
+            "• Emotions auto-detected\n\n"
+            "🎤 <b>Voice:</b> 12+ options\n"
+            "⚡ <b>Speed:</b> 5 options\n"
+            "🎨 <b>Theme:</b> 3 options"
+        )
+        await query.edit_message_text(
+            help_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    # Voice select
+    if data.startswith("voice_"):
+        index = int(data.split("_")[1]) - 1
+        voice_names = list(VOICES.keys())
+        if 0 <= index < len(voice_names):
+            selected_voice = voice_names[index]
+            voice_value = VOICES[selected_voice]
+            user_voices[user_id] = voice_value
+            await query.edit_message_text(
+                f"✅ Voice changed successfully!\n"
+                f"🎤 <b>{selected_voice}</b>\n\n"
+                f"Send any text to hear the new voice!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu()
+            )
+        return
+    
+    # Speed select
+    if data.startswith("speed_"):
+        speed = data.split("_")[1]
+        user_speeds[user_id] = speed
+        await query.edit_message_text(
+            f"✅ Speed changed successfully!\n"
+            f"⚡ <b>{speed}</b>\n\n"
+            f"Send any text to hear the new speed!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    # Theme select
+    if data.startswith("theme_"):
+        theme = data.split("_")[1]
+        user_themes[user_id] = theme
+        await query.edit_message_text(
+            f"✅ Theme changed successfully!\n"
+            f"🎨 <b>{theme}</b>\n\n"
+            f"<i>Theme will apply on restart</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu()
+        )
+        return
 
 # ----------------------------------------------------------------------
 # MAIN FUNCTION
 # ----------------------------------------------------------------------
 def main() -> None:
-    """बॉट स्टार्ट करें"""
-    # टोकन चेक करें
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: कृपया अपना बॉट टोकन सेट करें!")
-        print("📝 TOKEN = 'YOUR_BOT_TOKEN_HERE' को बदलें")
+    """Start the bot"""
+    if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ERROR: Bot token not set!")
         return
     
-    # Application बनाएं
+    # Build application
     app = Application.builder().token(TOKEN).build()
     
-    # कमांड हैंडलर
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("owner", owner_info))
     
-    # मैसेज हैंडलर (सिर्फ टेक्स्ट)
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
-        text_to_voice
-    ))
+    # Message handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_voice))
     
-    # बॉट स्टार्ट करें
-    print("🎙️ DRIFT Text to Voice Bot is running...")
-    print("🌐 हिंदी और अंग्रेज़ी सपोर्ट के साथ")
+    # Callback handler for buttons
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Start bot
+    print("🎙️ DRIFT VOICE BOT STARTED!")
+    print("👨‍💻 Owner: Pravin Kewat")
+    print("📱 Contact: @OWNERxMod1")
+    print("🌐 Languages: Hindi + English + Hinglish")
+    print("🎤 400+ Voices (Edge TTS)")
     print("📡 Polling started...")
     
     app.run_polling()
