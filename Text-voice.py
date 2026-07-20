@@ -23,9 +23,9 @@ COOLDOWN_SECONDS = 3
 
 # Branding
 BOT_NAME = "🎙️ DRIFT VOICE"
-OWNER_NAME = "Pravin Kewat"
-OWNER_CONTACT = "@OWNERxMod1"
-BOT_VERSION = "2.0"
+OWNER_NAME = os.environ.get("OWNER_NAME", "Pravin Kewat")
+OWNER_CONTACT = os.environ.get("OWNER_CONTACT", "@OWNERxMod1")
+BOT_VERSION = os.environ.get("BOT_VERSION", "2.1")
 
 # Rate limiting
 user_cooldowns = defaultdict(float)
@@ -269,6 +269,7 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>📌 Version:</b> {BOT_VERSION}\n"
         f"<b>📅 Updated:</b> July 2026\n\n"
+
         f"<b>🔧 Technology:</b>\n"
         f"• Python 3.11+\n"
         f"• Google TTS (gTTS)\n"
@@ -548,12 +549,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ----------------------------------------------------------------------
 def main() -> None:
     """Start the bot"""
-    if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: Please set your bot token!")
-        print("📝 TOKEN = 'YOUR_BOT_TOKEN_HERE' ko apne token se badlein")
+    if not TOKEN:
+        print("❌ ERROR: Please set TELEGRAM_BOT_TOKEN environment variable!")
+        print("📝 .env file ya hosting panel me TELEGRAM_BOT_TOKEN set karein")
         return
     
     print("🚀 Starting DRIFT VOICE BOT...")
+    print("🔐 Token loaded from environment variable")
     print(f"📦 Version: {BOT_VERSION}")
     print(f"👨‍💻 Owner: {OWNER_NAME}")
     print(f"📱 Contact: {OWNER_CONTACT}")
