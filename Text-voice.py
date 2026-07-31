@@ -14,7 +14,7 @@ from telebot.apihelper import ApiTelegramException
 # ---------- CONFIG ----------
 BOT_TOKEN = "8821679689:AAGUsUZkl2SqlreyHdHaxeFdorpuflP_8f0"  # Direct token
 
-ADMIN_IDS = [7423891642]  # अपना Telegram ID डालो
+ADMIN_IDS = [7306438851]  # अपना Telegram ID डालो
 CONFIG_FILE = "config.json"
 COOKIES_FILE = "cookies.json"
 LOG_FILE = "bot.log"
