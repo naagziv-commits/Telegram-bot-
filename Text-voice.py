@@ -17,7 +17,6 @@ BOT_TOKEN = "8821679689:AAGUsUZkl2SqlreyHdHaxeFdorpuflP_8f0"  # Direct token
 ADMIN_IDS = [7423891642]  # अपना Telegram ID डालो
 CONFIG_FILE = "config.json"
 COOKIES_FILE = "cookies.json"
-CHANNEL_USERNAME = "@editortrue"
 LOG_FILE = "bot.log"
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
@@ -385,13 +384,6 @@ threading.Thread(target=auto_saver, daemon=True).start()
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-def check_subscription(user_id: int) -> bool:
-    try:
-        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status not in ['left', 'kicked']
-    except ApiTelegramException:
-        return False
-
 def bool_icon(value: bool) -> str:
     return "✅" if value else "❌"
 
@@ -461,13 +453,6 @@ def model_edit_menu():
 # ---------- HANDLERS ----------
 @bot.message_handler(commands=["start"])
 def start_cmd(msg):
-    if not check_subscription(msg.from_user.id):
-        bot.send_message(msg.chat.id,
-                         "⚠️ कृपया पहले चैनल सब्सक्राइब करें:\nhttps://t.me/editortrue",
-                         reply_markup=InlineKeyboardMarkup().add(
-                             InlineKeyboardButton("अभी सब्सक्राइब करें", url="https://t.me/editortrue")
-                         ))
-        return
     bot.send_message(msg.chat.id,
                      "🤖 *नमस्ते! मैं अनऑफिशियल ChatGPT बॉट हूँ।*\n"
                      "कोई भी टेक्स्ट भेजें, मैं AI मॉडल से जवाब दूंगा।\n"
@@ -476,22 +461,12 @@ def start_cmd(msg):
 
 @bot.message_handler(commands=["new"])
 def new_cmd(msg):
-    if not check_subscription(msg.from_user.id):
-        bot.send_message(msg.chat.id, "⚠️ पहले @editortrue सब्सक्राइब करें")
-        return
     users.reset(msg.chat.id)
     bot.reply_to(msg, "✅ नई बातचीत शुरू हुई।", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_text(msg):
     chat_id = msg.chat.id
-    if not check_subscription(msg.from_user.id):
-        bot.send_message(chat_id,
-                         "⚠️ कृपया चैनल सब्सक्राइब करें:\nhttps://t.me/editortrue",
-                         reply_markup=InlineKeyboardMarkup().add(
-                             InlineKeyboardButton("अभी सब्सक्राइब करें", url="https://t.me/editortrue")
-                         ))
-        return
     text = msg.text.strip()
     if text.startswith("/"):
         return
@@ -566,10 +541,6 @@ def callback_handler(call):
     mid = call.message.message_id
     data = call.data
     uid = call.from_user.id
-
-    if not check_subscription(uid):
-        bot.answer_callback_query(call.id, "⚠️ पहले @editortrue सब्सक्राइब करें", show_alert=True)
-        return
 
     admin_actions = ["edit|", "toggle|", "search_toggle|", "model_select|", "payload_menu", "show_payload", "main_menu"]
     if any(data.startswith(p) for p in admin_actions if p.endswith("|") or p in admin_actions):
