@@ -1,1 +1,1 @@
-worker: python Text-voice.py
+worker: python bot.py
